@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>game client</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #12151c; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 14px; top: 12px;
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #8793a6; pointer-events: none; user-select: none;
+  }
+  #hud b { color: #cfd6e2; font-weight: 600; }
+</style>
+<!-- three.js comes from a CDN, so there is no build step. Pinned on purpose. -->
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="hud"><b>Connecting</b></div>
+
+<script type="module">
+import * as THREE from "three";
+
+/* ====================================================================
+ * 1. CONFIG
+ * ================================================================== */
+
+// Open the page as index.html?server=ws://host:port/ws to point elsewhere.
+const params = new URLSearchParams(location.search);
+const SERVER_URL =
+  params.get("server") || `ws://${location.hostname || "127.0.0.1"}:3000/ws`;
+
+const ARENA_HALF_SIZE = 16;     // must match the engine for now
+const INTERP_DELAY_MS = 50;     // render this far in the past so we can interpolate
+const RECONNECT_MS = 1000;
+
+/* ====================================================================
+ * 2. PROTOCOL  (mirror of protocol/src/lib.rs, little-endian)
+ *    Nothing in here knows about three.js. A different renderer can
+ *    reuse sections 2 and 3 untouched.
+ * ================================================================== */
+
+const PROTOCOL_VERSION = 1;
+const BTN = { UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8 };
+
+function decodeServerMsg(buf) {
+  const v = new DataView(buf);
+  switch (v.getUint8(0)) {
+    case 0x01:
+      return { type: "hello", version: v.getUint16(1, true), playerId: v.getUint32(3, true) };
+    case 0x02: {
+      const tick = v.getUint32(1, true);
+      const count = v.getUint16(5, true);
+      const entities = new Map();
+      let o = 7;
+      for (let i = 0; i < count; i++, o += 13) {
+        entities.set(v.getUint32(o, true), {
+          kind: v.getUint8(o + 4),
+          x: v.getFloat32(o + 5, true),
+          y: v.getFloat32(o + 9, true),
+        });
+      }
+      return { type: "snapshot", tick, entities };
+    }
+    default:
+      return null;
+  }
+}
+
+const encodeInput = (buttons) => new Uint8Array([0x01, buttons]);
+
+/* ====================================================================
+ * 3. NETWORK STATE, INPUT, INTERPOLATION  (still renderer-agnostic)
+ * ================================================================== */
+
+let ws = null;
+let status = "Connecting";
+let playerId = null;
+let latestTick = 0;
+let gaveUp = false;
+const buffer = []; // snapshots: { t: arrival time in ms, entities: Map(id -> {kind,x,y}) }
+
+function connect() {
+  ws = new WebSocket(SERVER_URL);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => { status = "Waiting for server"; };
+
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = decodeServerMsg(e.data); } catch { return; } // truncated or garbage: ignore
+    if (!msg) return;
+
+    if (msg.type === "hello") {
+      if (msg.version !== PROTOCOL_VERSION) {
+        gaveUp = true;
+        status = `Protocol mismatch: server ${msg.version}, client ${PROTOCOL_VERSION}`;
+        ws.close();
+        return;
+      }
+      playerId = msg.playerId;
+      status = "Connected";
+      sendInput(true); // the server forgot us, so tell it which keys are held
+    } else if (msg.type === "snapshot") {
+      latestTick = msg.tick;
+      buffer.push({ t: performance.now(), entities: msg.entities });
+      if (buffer.length > 60) buffer.shift(); // tab was hidden: don't grow forever
+    }
+  };
+
+  ws.onclose = () => {
+    playerId = null;
+    buffer.length = 0;
+    if (gaveUp) return;
+    status = "Disconnected, retrying";
+    setTimeout(connect, RECONNECT_MS);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+/* --- input: send a message only when the held keys change --- */
+
+const KEYMAP = {
+  KeyW: BTN.UP, ArrowUp: BTN.UP,
+  KeyS: BTN.DOWN, ArrowDown: BTN.DOWN,
+  KeyA: BTN.LEFT, ArrowLeft: BTN.LEFT,
+  KeyD: BTN.RIGHT, ArrowRight: BTN.RIGHT,
+};
+let buttons = 0;
+let sentButtons = 0;
+
+function sendInput(force = false) {
+  if (!force && buttons === sentButtons) return;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(encodeInput(buttons));
+    sentButtons = buttons;
+  }
+}
+
+addEventListener("keydown", (e) => {
+  const b = KEYMAP[e.code];
+  if (!b) return;
+  e.preventDefault();
+  buttons |= b;
+  sendInput();
+});
+addEventListener("keyup", (e) => {
+  const b = KEYMAP[e.code];
+  if (!b) return;
+  e.preventDefault();
+  buttons &= ~b;
+  sendInput();
+});
+addEventListener("blur", () => { buttons = 0; sendInput(); }); // no stuck keys
+
+/* --- interpolation: blend the two snapshots around (now - delay) --- */
+
+function sampleState(now) {
+  if (buffer.length === 0) return null;
+  const rt = now - INTERP_DELAY_MS;
+
+  while (buffer.length > 1 && buffer[1].t <= rt) buffer.shift();
+
+  const a = buffer[0];
+  const b = buffer[1];
+  if (!b || rt <= a.t) return a.entities; // not enough history yet: hold
+
+  const f = (rt - a.t) / (b.t - a.t);
+  const out = new Map();
+  for (const [id, eb] of b.entities) {
+    const ea = a.entities.get(id);
+    out.set(id, ea
+      ? { kind: eb.kind, x: ea.x + (eb.x - ea.x) * f, y: ea.y + (eb.y - ea.y) * f }
+      : eb); // just spawned: nothing to blend from
+  }
+  return out;
+}
+
+/* ====================================================================
+ * 4. RENDERER  (three.js lives only here)
+ *    The engine says what exists. This table says what it looks like.
+ * ================================================================== */
+
+const LOOK = {
+  1: { size: 0.9, color: 0x7f9cf5, mine: 0x5eead4 }, // cube
+};
+const UNKNOWN_LOOK = { size: 0.6, color: 0xff3df0, mine: 0xff3df0 }; // loud on purpose
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x12151c);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+camera.position.z = 10; // looking down -z at the XY plane, +y is up like the engine
+
+function resize() {
+  const w = innerWidth, h = innerHeight, aspect = w / h;
+  renderer.setSize(w, h);
+  // Always fit the whole arena plus a margin, in portrait and landscape.
+  const halfH = Math.max(ARENA_HALF_SIZE + 3, (ARENA_HALF_SIZE + 2) / aspect);
+  camera.top = halfH;
+  camera.bottom = -halfH;
+  camera.left = -halfH * aspect;
+  camera.right = halfH * aspect;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+
+/* --- arena: faint tile grid and a brighter border --- */
+{
+  const g = ARENA_HALF_SIZE;
+  const pts = [];
+  for (let i = -g; i <= g; i++) {
+    pts.push(i, -g, 0, i, g, 0, -g, i, 0, g, i, 0);
+  }
+  const grid = new THREE.BufferGeometry();
+  grid.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+  scene.add(new THREE.LineSegments(grid, new THREE.LineBasicMaterial({ color: 0x1d2330 })));
+
+  const border = new THREE.BufferGeometry();
+  border.setAttribute("position", new THREE.Float32BufferAttribute(
+    [-g, -g, 0.01, g, -g, 0.01, g, g, 0.01, -g, g, 0.01], 3));
+  scene.add(new THREE.LineLoop(border, new THREE.LineBasicMaterial({ color: 0x3b475a })));
+}
+
+/* --- entity meshes, created and removed as the state changes --- */
+
+const unitSquare = new THREE.PlaneGeometry(1, 1);
+const materials = new Map(); // "color" -> material, shared
+const meshes = new Map();    // entity id -> mesh
+
+function material(color) {
+  let m = materials.get(color);
+  if (!m) { m = new THREE.MeshBasicMaterial({ color }); materials.set(color, m); }
+  return m;
+}
+
+function makeMesh(kind, isMine) {
+  const look = LOOK[kind] || UNKNOWN_LOOK;
+  const mesh = new THREE.Mesh(unitSquare, material(isMine ? look.mine : look.color));
+  mesh.scale.set(look.size, look.size, 1);
+  return mesh;
+}
+
+function syncScene(state) {
+  if (!state) {
+    for (const m of meshes.values()) scene.remove(m);
+    meshes.clear();
+    return;
+  }
+  for (const [id, e] of state) {
+    let m = meshes.get(id);
+    if (!m) {
+      m = makeMesh(e.kind, id === playerId);
+      meshes.set(id, m);
+      scene.add(m);
+    }
+    m.position.set(e.x, e.y, 0.1);
+  }
+  for (const [id, m] of meshes) {
+    if (!state.has(id)) { scene.remove(m); meshes.delete(id); }
+  }
+}
+
+/* --- HUD, refreshed a few times a second rather than every frame --- */
+
+const hud = document.getElementById("hud");
+let lastHud = 0;
+function updateHud(now, count) {
+  if (now - lastHud < 250) return;
+  lastHud = now;
+  hud.innerHTML = playerId === null
+    ? `<b>${status}</b>`
+    : `<b>${status}</b><br>You are player ${playerId}<br>Tick ${latestTick}, ${count} in arena<br>Move with WASD or the arrow keys`;
+}
+
+/* --- main loop --- */
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const state = sampleState(now);
+  syncScene(state);
+  renderer.render(scene, camera);
+  updateHud(now, state ? state.size : 0);
+}
+
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
